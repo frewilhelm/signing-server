@@ -1,4 +1,4 @@
-REGISTRY := github.com/open-component-model/signing-server
+REGISTRY := ghcr.io/open-component-model
 
 ifeq ($(OS),Windows_NT)
     REPO_ROOT := $(CURDIR)
@@ -9,8 +9,7 @@ else
 endif
 EFFECTIVE_VERSION                := $(VERSION)-$(shell git rev-parse HEAD)
 
-# REGISTRY                         := europe-docker.pkg.dev/gardener-project/releases
-IMAGE_REPOSITORY                 := $(REGISTRY)/cicd/signing-server
+IMAGE_REPOSITORY                 := $(REGISTRY)/signing-server
 
 PRIVATE_KEY_SECRET_NAME := private-key
 CERT_CM_NAME := cert

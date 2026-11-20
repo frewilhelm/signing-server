@@ -1,58 +1,142 @@
 name: Build
 
+# Builds the signing-server image and Helm chart for one version and pushes
+# both to GHCR, with build provenance attestations. Called by release.yaml and
+# non-release.yaml.
+
 on:
   workflow_call:
     inputs:
-      mode:
+      version:
         required: true
         type: string
-        default: snapshot
-        description: |
-          the mode to use. either `snapshot` or `release`. Will affect effective version, as well
-          as target-oci-registry.
+        description: Version for the image tag, chart version and appVersion.
+      ref:
+        required: true
+        type: string
+        description: Commit to build.
+      image-repository:
+        required: true
+        type: string
+        description: Image repository without tag, e.g. ghcr.io/open-component-model/signing-server.
+      chart-repository:
+        required: true
+        type: string
+        description: OCI repository the chart is pushed into, e.g. ghcr.io/open-component-model/charts.
+    outputs:
+      image-ref:
+        description: Pushed image as <repository>:<version>@<digest>.
+        value: ${{ jobs.build.outputs.image-ref }}
+      chart-ref:
+        description: Pushed chart as <repository>/signing-server:<version>@<digest>.
+        value: ${{ jobs.build.outputs.chart-ref }}
+
+permissions: {}
 
 jobs:
-  prepare:
-    uses: gardener/cc-utils/.github/workflows/prepare.yaml@master
-    permissions:
-      id-token: write
-    with:
-      mode: ${{ inputs.mode }}
-
-  oci-images:
-    name: Build OCI-Images
-    uses: gardener/cc-utils/.github/workflows/oci-ocm.yaml@master
-    needs:
-      - prepare
+  build:
+    name: Image and Helm chart
+    runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
-      id-token: write
-    with:
-      name: signing-server
-      version: ${{ needs.prepare.outputs.version }}
-      oci-registry: ${{ needs.prepare.outputs.oci-registry }}
-      oci-repository: cicd/signing-server
-      oci-platforms: linux/amd64
-      ctx: oci-images
+      packages: write # push image and chart to GHCR
+      id-token: write # sign provenance attestations
+      attestations: write # store provenance attestations
+    outputs:
+      image-ref: ${{ steps.refs.outputs.image-ref }}
+      chart-ref: ${{ steps.refs.outputs.chart-ref }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
 
-  helmcharts:
-    name: Build Helmcharts
-    uses: gardener/cc-utils/.github/workflows/helmchart-ocm.yaml@master
-    needs:
-      - prepare
-      - oci-images
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-    with:
-      name: signing-server
-      dir: chart
-      oci-registry: ${{ needs.prepare.outputs.oci-registry }}
-      oci-repository: cicd/charts
-      ocm-mappings: |
-        - ref: ocm-resource:signing-server.repository
-          attribute: image.repository
-        - ref: ocm-resource:signing-server.tag
-          attribute: image.tag
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # The Dockerfile builds for linux/amd64 only (GOARCH is fixed there).
+      - name: Build and push image
+        id: image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false # attested below with actions/attest-build-provenance
+          tags: ${{ inputs.image-repository }}:${{ inputs.version }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ inputs.ref }}
+            org.opencontainers.image.version=${{ inputs.version }}
+
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ inputs.image-repository }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+
+      - name: Set up Helm
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+
+      # Replaces the former cc-utils ocm-mappings: the chart defaults to the
+      # image built above.
+      - name: Package and push chart
+        id: chart
+        env:
+          VERSION: ${{ inputs.version }}
+          IMAGE_REPOSITORY: ${{ inputs.image-repository }}
+          CHART_REPOSITORY: ${{ inputs.chart-repository }}
+        run: |
+          set -euo pipefail
+          sed -i \
+            -e "s|^  repository: ~$|  repository: ${IMAGE_REPOSITORY}|" \
+            -e "s|^  tag: ~$|  tag: \"${VERSION}\"|" \
+            chart/values.yaml
+          grep -qxF "  repository: ${IMAGE_REPOSITORY}" chart/values.yaml
+          grep -qxF "  tag: \"${VERSION}\"" chart/values.yaml
+
+          helm package chart --version "${VERSION}" --app-version "${VERSION}" --destination "${RUNNER_TEMP}/chart"
+          helm push "${RUNNER_TEMP}/chart/signing-server-${VERSION}.tgz" "oci://${CHART_REPOSITORY}" 2>&1 | tee "${RUNNER_TEMP}/helm-push.log"
+          digest="$(sed -n 's/^Digest: \(sha256:[0-9a-f]\{64\}\)$/\1/p' "${RUNNER_TEMP}/helm-push.log")"
+          if [[ -z "${digest}" ]]; then
+            echo "::error::could not read the chart digest from helm push"
+            exit 1
+          fi
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Attest chart provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ inputs.chart-repository }}/signing-server
+          subject-digest: ${{ steps.chart.outputs.digest }}
+          push-to-registry: true
+
+      - name: Output references
+        id: refs
+        env:
+          VERSION: ${{ inputs.version }}
+          IMAGE_REPOSITORY: ${{ inputs.image-repository }}
+          CHART_REPOSITORY: ${{ inputs.chart-repository }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          CHART_DIGEST: ${{ steps.chart.outputs.digest }}
+        run: |
+          set -euo pipefail
+          {
+            echo "image-ref=${IMAGE_REPOSITORY}:${VERSION}@${IMAGE_DIGEST}"
+            echo "chart-ref=${CHART_REPOSITORY}/signing-server:${VERSION}@${CHART_DIGEST}"
+          } >> "${GITHUB_OUTPUT}"
+          {
+            echo "### Published"
+            echo "- Image: \`${IMAGE_REPOSITORY}:${VERSION}@${IMAGE_DIGEST}\`"
+            echo "- Chart: \`${CHART_REPOSITORY}/signing-server:${VERSION}@${CHART_DIGEST}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"

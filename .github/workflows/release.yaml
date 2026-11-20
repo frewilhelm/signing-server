@@ -1,31 +1,323 @@
 name: Release
+
+# Releases the version in VERSION (without its -dev suffix) from main.
+#
+# Nothing is pushed to main: the org rulesets allow changes to main only
+# through reviewed pull requests with signed commits.
+#   1. prepare         compute release and next version, refuse existing tags
+#   2. build           image + Helm chart to GHCR (build.yaml)
+#   3. ocm             OCM component ocm.software/signing-server, keyless signed
+#   4. tag             tag the released main commit (ocm-bot-release)
+#   5. github-release  GitHub release for that tag
+#   6. bump-pr         pull request setting VERSION to the next -dev version
+#                      (ocm-bot-pull-request)
+# The tag is created only after all artifacts are published, so a failed run
+# can be re-run without burning a version (tags are immutable).
+
 on:
   workflow_dispatch:
     inputs:
       next-version:
+        description: How to compute the next development version after this release.
         type: choice
         options:
           - bump-minor
           - bump-patch
 
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+
 jobs:
-  build:
-    uses: ./.github/workflows/build.yaml
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
-      id-token: write
-    with:
-      mode: release
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      next-version: ${{ steps.version.outputs.next-version }}
+      previous-tag: ${{ steps.version.outputs.previous-tag }}
+      sha: ${{ steps.version.outputs.sha }}
+      owner: ${{ steps.version.outputs.owner }}
+    steps:
+      - name: Require main
+        if: github.ref != 'refs/heads/main'
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          echo "::error::releases are made from refs/heads/main only, not ${REF}"
+          exit 1
 
-  release-to-github-and-bump:
-    uses: gardener/cc-utils/.github/workflows/release.yaml@master
-    needs:
-      - build
-    permissions:
-      contents: write
-      packages: write
-      id-token: write
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # tags for the previous release
+          persist-credentials: false
+
+      - name: Compute versions
+        id: version
+        env:
+          NEXT_VERSION_OPERATION: ${{ inputs.next-version }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          current="$(tr -d '[:space:]' < VERSION)"
+          if [[ ! "${current}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)-dev$ ]]; then
+            echo "::error::VERSION must be X.Y.Z-dev, got '${current}'"
+            exit 1
+          fi
+          major="${BASH_REMATCH[1]}" minor="${BASH_REMATCH[2]}" patch="${BASH_REMATCH[3]}"
+          version="${major}.${minor}.${patch}"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${version}" >/dev/null; then
+            echo "::error::tag ${version} already exists; raise VERSION on main to an unreleased X.Y.Z-dev"
+            exit 1
+          fi
+
+          case "${NEXT_VERSION_OPERATION}" in
+            bump-minor) next="${major}.$((minor + 1)).0-dev" ;;
+            bump-patch) next="${major}.${minor}.$((patch + 1))-dev" ;;
+            *) echo "::error::unknown next-version '${NEXT_VERSION_OPERATION}'"; exit 1 ;;
+          esac
+
+          # Last release reachable from main; tags of failed releases on
+          # commits outside main (0.4.0, 0.4.1) are skipped automatically.
+          previous_tag="$(git describe --tags --abbrev=0 HEAD 2>/dev/null || true)"
+
+          {
+            echo "version=${version}"
+            echo "next-version=${next}"
+            echo "previous-tag=${previous_tag}"
+            echo "sha=$(git rev-parse HEAD)"
+            echo "owner=${OWNER,,}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "Releasing ${version} from $(git rev-parse HEAD), next ${next}, notes since '${previous_tag}'" >> "${GITHUB_STEP_SUMMARY}"
+
+  build:
+    name: Build
+    needs: prepare
+    permissions: # as required by build.yaml
+      contents: read
+      packages: write # push image and chart to GHCR
+      id-token: write # sign provenance attestations
+      attestations: write # store provenance attestations
+    uses: ./.github/workflows/build.yaml
     with:
-      release-commit-target: branch
-      next-version: ${{ inputs.next-version }}
+      version: ${{ needs.prepare.outputs.version }}
+      ref: ${{ needs.prepare.outputs.sha }}
+      image-repository: ghcr.io/${{ needs.prepare.outputs.owner }}/signing-server
+      chart-repository: ghcr.io/${{ needs.prepare.outputs.owner }}/charts
+
+  ocm:
+    name: OCM component
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push the component version to GHCR
+      id-token: write # keyless Sigstore signing
+    env:
+      # Full CLI image: ships cosign, which the Sigstore signer calls.
+      OCM_CLI_IMAGE: ghcr.io/open-component-model/cli:0.24.0@sha256:92c9dde286345d72f468ae1caf3f43a61e9beb70d1215ce6eb0e902cdc4c5a03
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Write OCM config
+        run: |
+          set -euo pipefail
+          cat > "${HOME}/.ocmconfig" <<'EOF'
+          type: generic.config.ocm.software/v1
+          configurations:
+            - type: credentials.config.ocm.software
+              repositories:
+                - repository:
+                    type: DockerConfig/v1
+                    dockerConfigFile: /.docker/config.json
+                    propagateConsumerIdentity: true
+            # Keyless Sigstore: public-good Fulcio and Rekor, trust roots via TUF.
+            - type: signing.config.ocm.software/v1alpha1
+              signer:
+                type: SigstoreSigningConfiguration/v1alpha1
+          EOF
+
+      # Mirrors open-component-model/open-component-model
+      # .github/workflows/publish-components.yml. The image runs as a non-root
+      # user; run as the runner user so the docker config (0600) is readable.
+      # A re-run replaces the component version of a failed run (the CLI's
+      # default; the tag is only created after this job succeeds).
+      - name: Add component version
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          IMAGE_REF: ${{ needs.build.outputs.image-ref }}
+          CHART_REF: ${{ needs.build.outputs.chart-ref }}
+          OCM_REPOSITORY: ghcr.io/${{ needs.prepare.outputs.owner }}
+          WORKSPACE: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,exec \
+            -e TMPDIR=/tmp \
+            -v "${HOME}/.docker/config.json:/.docker/config.json:ro" \
+            -v "${HOME}/.ocmconfig:/.ocmconfig:ro" \
+            -v /etc/ssl/certs/:/etc/ssl/certs/:ro \
+            -v "${WORKSPACE}:${WORKSPACE}:ro" \
+            -w "${WORKSPACE}" \
+            -e VERSION \
+            -e IMAGE_REF \
+            -e CHART_REF \
+            "${OCM_CLI_IMAGE}" \
+              add component-version \
+              --config /.ocmconfig \
+              --repository "${OCM_REPOSITORY}" \
+              --constructor .ocm/component-constructor.yaml
+
+      - name: Sign component version (keyless Sigstore)
+        env:
+          COMPONENT_REF: ghcr.io/${{ needs.prepare.outputs.owner }}//ocm.software/signing-server:${{ needs.prepare.outputs.version }}
+          WORKSPACE: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,exec \
+            -e HOME=/tmp \
+            -e TMPDIR=/tmp \
+            -e ACTIONS_ID_TOKEN_REQUEST_TOKEN \
+            -e ACTIONS_ID_TOKEN_REQUEST_URL \
+            -v "${HOME}/.docker/config.json:/.docker/config.json:ro" \
+            -v "${HOME}/.ocmconfig:/.ocmconfig:ro" \
+            -v /etc/ssl/certs/:/etc/ssl/certs/:ro \
+            -v "${WORKSPACE}:${WORKSPACE}:ro" \
+            -w "${WORKSPACE}" \
+            "${OCM_CLI_IMAGE}" \
+              sign component-version \
+              --config /.ocmconfig \
+              "${COMPONENT_REF}"
+          echo "- OCM component: \`${COMPONENT_REF}\`" >> "${GITHUB_STEP_SUMMARY}"
+
+  tag:
+    name: Tag release
+    needs: [prepare, ocm]
+    runs-on: ubuntu-latest
+    environment:
+      name: release-automation
+      deployment: false
+    permissions: {} # the tag is created with the release bot token
+    steps:
+      - name: Get release bot token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write # create the tag
+
+      # Lightweight tag on the released main commit, like the existing tags.
+      - name: Create tag
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f "ref=refs/tags/${VERSION}" \
+            -f "sha=${SHA}"
+
+  github-release:
+    name: GitHub release
+    needs: [prepare, build, tag]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release for the existing tag
+    steps:
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PREVIOUS_TAG: ${{ needs.prepare.outputs.previous-tag }}
+          IMAGE_REF: ${{ needs.build.outputs.image-ref }}
+          CHART_REF: ${{ needs.build.outputs.chart-ref }}
+          OWNER: ${{ needs.prepare.outputs.owner }}
+        run: |
+          set -euo pipefail
+          notes="$(cat <<EOF
+          ## Artifacts
+
+          - Image: \`${IMAGE_REF}\`
+          - Helm chart: \`oci://${CHART_REF%%:*}\` version \`${VERSION}\`
+          - OCM component: \`ghcr.io/${OWNER}//ocm.software/signing-server:${VERSION}\`
+          EOF
+          )"
+          args=(--repo "${GITHUB_REPOSITORY}" --verify-tag --title "${VERSION}" --generate-notes --notes "${notes}")
+          if [[ -n "${PREVIOUS_TAG}" ]]; then
+            args+=(--notes-start-tag "${PREVIOUS_TAG}")
+          fi
+          gh release create "${VERSION}" "${args[@]}"
+
+  bump-pr:
+    name: Next development version
+    needs: [prepare, github-release]
+    runs-on: ubuntu-latest
+    environment:
+      name: pull-requests
+      deployment: false
+    permissions:
+      contents: read
+    steps:
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Set next version
+        env:
+          NEXT_VERSION: ${{ needs.prepare.outputs.next-version }}
+        run: echo "${NEXT_VERSION}" > VERSION
+
+      - name: Get pull request bot token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.PR_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.PR_BOT_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Create pull request
+        uses: peter-evans/create-pull-request@3ffccacd46053766916f087ce41d627c0b8cf2d1 # v8.1.3
+        with:
+          base: main
+          token: ${{ steps.app-token.outputs.token }}
+          branch: automation/release-bump
+          delete-branch: true
+          sign-commits: true
+          add-paths: VERSION
+          title: "chore: bump version to ${{ needs.prepare.outputs.next-version }}"
+          commit-message: "chore: bump version to ${{ needs.prepare.outputs.next-version }}"
+          body: |
+            Sets `VERSION` to the next development version after release
+            [${{ needs.prepare.outputs.version }}](${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.prepare.outputs.version }}).
+
+            Created by the [release workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).

@@ -1,22 +1,62 @@
-name: CI (non-release)
+name: Snapshot
+
+# Publishes a snapshot image and Helm chart for every commit on main, version
+# <VERSION>-<commit> (same scheme as EFFECTIVE_VERSION in the Makefile).
+
 on:
   push:
+    branches:
+      - main
   workflow_dispatch:
 
+permissions: {}
+
+concurrency:
+  group: snapshot-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build:
-    uses: ./.github/workflows/build.yaml
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
-      id-token: write
-    with:
-      mode: snapshot
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      owner: ${{ steps.version.outputs.owner }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-  component-descriptor:
-    uses: gardener/cc-utils/.github/workflows/post-build.yaml@master
-    needs:
-      - build
-    permissions:
-      contents: write
-      id-token: write
+      - name: Compute version
+        id: version
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          current="$(tr -d '[:space:]' < VERSION)"
+          if [[ ! "${current}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-dev$ ]]; then
+            echo "::error::VERSION must be X.Y.Z-dev, got '${current}'"
+            exit 1
+          fi
+          {
+            echo "version=${current}-${GITHUB_SHA}"
+            echo "owner=${OWNER,,}"
+          } >> "${GITHUB_OUTPUT}"
+
+  build:
+    name: Build
+    needs: prepare
+    permissions: # as required by build.yaml
+      contents: read
+      packages: write # push image and chart to GHCR
+      id-token: write # sign provenance attestations
+      attestations: write # store provenance attestations
+    uses: ./.github/workflows/build.yaml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      ref: ${{ github.sha }}
+      image-repository: ghcr.io/${{ needs.prepare.outputs.owner }}/snapshots/signing-server
+      chart-repository: ghcr.io/${{ needs.prepare.outputs.owner }}/snapshots/charts

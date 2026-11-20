@@ -244,6 +244,22 @@ To generate a client certificate perform the following steps. These steps are op
 - Run `./signing-server --server` to locally run the server. Run `./signing-server --help` to get help on the correct configuration
 - Use `hack/run` to create necessary keys and certificates and run the server.
 
+### Releases
+
+Releases are published to GHCR (since 0.4.2; earlier releases are in `europe-docker.pkg.dev/gardener-project/releases`):
+
+- Image: `ghcr.io/open-component-model/signing-server:<version>`
+- Helm chart: `oci://ghcr.io/open-component-model/charts/signing-server` (its default `image` points to the image above)
+- OCM component: `ocm.software/signing-server` in the OCM repository `ghcr.io/open-component-model`
+
+Snapshots of every commit on `main` are published as `<version>-dev-<commit>` to `ghcr.io/open-component-model/snapshots/signing-server` and `oci://ghcr.io/open-component-model/snapshots/charts/signing-server`.
+
+To install a release:
+
+```sh
+helm upgrade <release-name> oci://ghcr.io/open-component-model/charts/signing-server --version <version> -f <values-file> --install
+```
+
 ### Run in K8s Cluster
 
 - Clone this repository to your local machine

@@ -1,0 +1,23 @@
+# OCM component published by .github/workflows/release.yaml with the ocm CLI
+# (add component-version). ${VERSION}, ${IMAGE_REF} and ${CHART_REF} are
+# taken from the environment of that step; both references are pinned by digest.
+components:
+  - name: ocm.software/signing-server
+    version: "${VERSION}"
+    provider:
+      name: ocm.software
+    resources:
+      - name: signing-server
+        type: ociImage
+        version: "${VERSION}"
+        relation: local
+        access:
+          type: OCIImage/v1
+          imageReference: "${IMAGE_REF}"
+      - name: chart
+        type: helmChart
+        version: "${VERSION}"
+        relation: local
+        access:
+          type: OCIImage/v1
+          imageReference: "${CHART_REF}"
